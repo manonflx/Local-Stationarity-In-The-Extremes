@@ -1,0 +1,798 @@
+---
+title: "LocExt_MF"
+author: "Manon Felix"
+date: "2025-12-04"
+output: html_document
+---
+
+
+
+# Data Analysis for Financial Returns: CAC40 & DAX
+
+
+# 1. Load required packages
+
+```{r}
+library(tidyverse)
+library(glue)
+library(lubridate)
+library(quantmod)
+library(boot)
+library(ggplot2)
+library(gridExtra)
+
+
+```
+
+
+# 1.1 Load and process CAC40 data
+
+```{r}
+# -------------------------------
+# 2. Set working directory
+# -------------------------------
+setwd("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/Data_application/CAC40GR")
+
+
+CAC40GR_1980to2007 <- read_csv(
+  "CAC40GR_1980to2007.csv", 
+  col_types = cols(
+    Date = col_date(format = "%m/%d/%Y"), 
+    Price = col_number(), 
+    Open = col_number(), 
+    High = col_number(), 
+    Low = col_number(), 
+    Vol. = col_skip(), 
+    `Change %` = col_skip()
+  )
+)
+
+CAC40GR_2007to2025 <- read_csv(
+  "CAC40GR_2007to2025.csv", 
+  col_types = cols(
+    Date = col_date(format = "%m/%d/%Y"), 
+    Price = col_number(), 
+    Open = col_number(), 
+    High = col_number(), 
+    Low = col_number(), 
+    Vol. = col_skip(), 
+    `Change %` = col_skip()
+  )
+)
+
+# Merge and process
+CAC40 <- rbind(CAC40GR_2007to2025, CAC40GR_1980to2007) %>%
+  arrange(Date) %>%
+  rename(date = Date, value = Price, open = Open, high = High, low = Low) %>%
+  mutate(
+    log_return = log(value) - lag(log(value)),
+    range_t = pmax(high, low) - pmin(high, low)
+  )
+
+# -------------------------------
+# 4. Load and process DAX data
+# -------------------------------
+getSymbols("^GDAXI", src = "yahoo", from = "1980-01-01", to = Sys.Date())
+
+DAX <- as.data.frame(GDAXI) %>%
+  rownames_to_column("date") %>%
+  mutate(date = ymd(date)) %>%
+  transmute(
+    date,
+    value = GDAXI.Close,
+    open  = GDAXI.Open,
+    high  = GDAXI.High,
+    low   = GDAXI.Low
+  ) %>%
+  arrange(date) %>%
+  mutate(
+    log_return = log(value) - lag(log(value)),
+    range_t = pmax(high, low) - pmin(high, low)
+  )
+
+# -------------------------------
+# 5. Create X (log-returns) and Y (squared log-returns)
+# -------------------------------
+X <- left_join(CAC40, DAX, by = "date", suffix = c(".CAC40", ".DAX")) %>%
+  select(date, log_return.CAC40, log_return.DAX) %>%
+  na.omit()
+
+Y <- X %>%
+  mutate(
+    sq_log_return.CAC40 = log_return.CAC40^2,
+    sq_log_return.DAX   = log_return.DAX^2
+  ) %>%
+  select(date, sq_log_return.CAC40, sq_log_return.DAX)
+```
+
+
+
+
+# 1.2 Plot squared log-returns
+
+```{r}
+p1 <- ggplot(Y, aes(x = date, y = sq_log_return.CAC40)) +
+  geom_line(color = "darkblue") +
+  labs(title = "CAC40 Daily Squared Log Returns",
+       x = "Date", y = expression((log~return)^2)) +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(panel.grid = element_blank(),
+        legend.position = "none",
+        plot.title = element_text(size = 18, family = "Times"),
+        axis.title = element_text(size = 18, family = "Times"),
+        axis.text = element_text(size = 18, family = "Times"))
+
+p2 <- ggplot(Y, aes(x = date, y = sq_log_return.DAX)) +
+  geom_line(color = "darkblue") +
+  labs(title = "DAX Daily Squared Log Returns",
+       x = "Date", y = expression((log~return)^2)) +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(panel.grid = element_blank(),
+        legend.position = "none",
+        plot.title = element_text(size = 18, family = "Times"),
+        axis.title = element_text(size = 18, family = "Times"),
+        axis.text = element_text(size = 18, family = "Times"))
+
+# Arrange and save
+combined_plot <- arrangeGrob(p1, p2, ncol = 2)
+
+p1
+p2
+```
+
+# 1.3 QQ-plots for selected periods
+
+```{r}
+periods <- list(
+  list(start = as.Date("1995-01-01"), end = as.Date("1997-01-12")),
+  list(start = as.Date("2003-01-01"), end = as.Date("2005-01-12")),
+  list(start = as.Date("2011-01-01"), end = as.Date("2013-01-12"))
+)
+
+make_qq_plot <- function(start_date, end_date, data) {
+  CAC_filtered <- data %>% filter(date >= start_date & date <= end_date) %>% select(date, sq_log_return.CAC40)
+  DAX_filtered <- data %>% filter(date >= start_date & date <= end_date) %>% select(date, sq_log_return.DAX)
+  
+  joined <- inner_join(CAC_filtered, DAX_filtered, by = "date") %>% drop_na()
+  
+  qq_data <- qqplot(joined$sq_log_return.CAC40, joined$sq_log_return.DAX, plot.it = FALSE)
+  qq_df <- data.frame(CAC40 = qq_data$x, DAX = qq_data$y)
+  
+  ggplot(qq_df, aes(x = CAC40, y = DAX)) +
+    geom_point(color = "black") +
+    geom_smooth(method = "lm", formula = y ~ poly(x, 1, raw = TRUE), se = FALSE, color = "blue", size = 0.7) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    labs(title = paste(format(start_date, "%Y-%m-%d"), "to", format(end_date, "%Y-%m-%d")),
+         x = expression("Quantiles of " ~ X[1]^2),
+         y = expression("Quantiles of " ~ X[2]^2)) +
+    scale_x_continuous(breaks = seq(0, 0.005, by = 0.001)) +
+    scale_y_continuous(breaks = seq(0, 0.005, by = 0.001)) +
+    theme_minimal()
+}
+
+qq_plots <- lapply(periods, function(p) make_qq_plot(p$start, p$end, Y))
+
+# Save combined QQ-plots
+grid.arrange(qq_plots[[1]], qq_plots[[2]], qq_plots[[3]], ncol = 3)
+
+
+```
+
+
+
+
+
+## 2. Kernel function and optimal bandwidth 
+
+
+```{r}
+# -------------------------------
+# 1. Kernel Function
+# -------------------------------
+# Epanechnikov-type kernel function
+# Arguments:
+#   u0 : evaluation point (0 < u0 < 1)
+#   n  : number of observations
+#   b  : bandwidth
+# Returns:
+#   Vector of kernel weights of length n
+kern.func <- function(u0, n, b) {
+  u <- (u0 - (1:n)/n) / b
+  K <- ifelse(abs(u) <= 0.5, 6 * (0.25 - u^2), 0)
+  return(K)
+}
+
+# -------------------------------
+# 2. Example: Counting entries in a date range
+# -------------------------------
+start_date <- as.Date("2013-01-01")
+end_date   <- as.Date("2015-12-31")
+
+# Count number of entries in X within the specified period
+n_entries <- sum(X$date >= start_date & X$date < end_date)
+
+# -------------------------------
+# 3. Candidate optimal bandwidth
+# -------------------------------
+# Rule-of-thumb: proportion of entries in the period
+bnopt <- n_entries / length(X$log_return.CAC40)
+
+# Print optimal bandwidth
+print(paste("Candidate optimal bandwidth (bnopt):", round(bnopt, 4)))
+
+```
+
+
+
+# Section: Motivation 
+
+```{r}
+# -------------------------------
+# Section: Motivation
+# -------------------------------
+
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(gridExtra)
+
+# Set probability for extreme quantiles
+prob <- 0.95
+n <- nrow(Y)
+time_scaled <- seq_len(n) / n
+
+# Target dates for analysis
+target_dates <- as.Date(c("1996-07-02", "2004-07-02", "2012-07-02"))
+
+# Find closest indices in Y$date for target dates
+closest_idx <- sapply(target_dates, function(x) which.min(abs(Y$date - x)))
+target_us <- time_scaled[closest_idx]
+
+# Define periods around target dates
+years_before <- 1
+years_after <- 1
+letters_labels <- paste0(letters[1:length(target_dates)], ")")
+
+periods <- lapply(seq_along(target_dates), function(i) {
+  d <- target_dates[i]
+  start_year <- year(d) - years_before
+  end_year <- year(d) + years_after
+  list(
+    start = as.Date(paste0(start_year, "-01-01")),
+    end   = as.Date(paste0(end_year, "-12-31")),
+    label = paste0(letters_labels[i], " ", start_year, "–", end_year)
+  )
+})
+
+# -------------------------------
+# Compute extreme thresholds
+# -------------------------------
+
+estam <- numeric(length(target_us))
+
+for (i in seq_along(target_us)) {
+  y <- as.matrix(Y[, 2:3])
+  
+  # Custom CDF with kernel smoothing
+  custom_cdf <- function(val, u, X) {
+    kernel <- kern.func(u, n = length(Y$sq_log_return.CAC40), b = bnopt)
+    sum(kernel * (X < val)) / sum(kernel)
+  }
+  
+  # Inverse CDF
+  invcdf <- function(p, X, u) {
+    uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+  }
+  
+  row_max <- apply(abs(y), 1, max)
+  estam[i] <- invcdf(prob, row_max, target_us[i])
+}
+
+# -------------------------------
+# Data preparation functions
+# -------------------------------
+
+filter_period_data_Y <- function(CAC40, DAX, start_date, end_date) {
+  CAC_filtered <- CAC40 %>%
+    filter(date >= start_date & date <= end_date) %>%
+    select(date, log_return) %>%
+    mutate(cac_sq = log_return^2)
+  
+  DAX_filtered <- DAX %>%
+    filter(date >= start_date & date <= end_date) %>%
+    select(date, log_return) %>%
+    mutate(dax_sq = log_return^2)
+  
+  inner_join(CAC_filtered, DAX_filtered, by = "date") %>% drop_na()
+}
+
+make_extreme_plot_Y <- function(data, threshold, title) {
+  extreme_data <- data %>% filter(cac_sq > threshold & dax_sq > threshold)
+  nonextreme_data <- data %>% filter(cac_sq <= threshold | dax_sq <= threshold)
+  CACextreme <- data %>% filter(cac_sq > threshold & dax_sq <= threshold)
+  DAXextreme <- data %>% filter(dax_sq > threshold & cac_sq <= threshold)
+  
+  max_val <- 0.005
+  
+  ggplot(extreme_data, aes(x = cac_sq, y = dax_sq)) +
+    geom_point(color = "darkred", alpha = 0.7, size = 1.4) +
+    geom_point(data = nonextreme_data, color = "lightgrey", alpha = 0.7, size = 1.4) +
+    geom_point(data = CACextreme, color = "skyblue4", alpha = 0.7, size = 1.4, shape = 17) +
+    geom_point(data = DAXextreme, color = "springgreen4", alpha = 0.7, size = 1.4, shape = 4) +
+    annotate("segment", x = 0, xend = max_val, y = threshold, yend = threshold,
+             color = "lightgrey", linetype = "dashed", alpha = 0.8, size = 0.7) +
+    annotate("segment", x = threshold, xend = threshold, y = 0, yend = max_val,
+             color = "lightgrey", linetype = "dashed", alpha = 0.8, size = 0.7) +
+    labs(
+      title = title,
+      x = expression((log~return~CAC40)^2),
+      y = expression((log~return~DAX)^2)
+    ) +
+    coord_cartesian(xlim = c(0, max_val), ylim = c(0, max_val)) +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_line(color = "grey90", size = 0.2),
+      panel.grid.minor = element_line(color = "grey95", size = 0.1),
+      aspect.ratio = 1,
+      plot.title = element_text(size = 12, family = "Times"),
+      axis.title = element_text(size = 10, family = "Times"),
+      axis.text = element_text(size = 10, family = "Times")
+    )
+}
+
+# -------------------------------
+# Generate plots for each period
+# -------------------------------
+
+plots_Y <- lapply(seq_along(periods), function(i) {
+  period <- periods[[i]]
+  data_period <- filter_period_data_Y(CAC40, DAX, period$start, period$end)
+  make_extreme_plot_Y(data_period, estam[i], paste(period$letter, "Period:", period$label))
+})
+
+# Display plots
+gridExtra::grid.arrange(grobs = plots_Y, ncol = 3)
+
+
+
+```
+
+# Section: Estimation of intermediate quantiles
+
+```{r}
+# ----------------------------------------------
+# Section: Estimation of Intermediate Quantiles
+# ----------------------------------------------
+
+library(tidyverse)
+library(ggplot2)
+library(boot)
+library(gridExtra)
+
+# -----------------------------
+# 1. Stationary Bootstrap
+# -----------------------------
+
+custom_cdf_stat <- function(y, X) {
+  mean(X < y)  # empirical CDF
+}
+
+invcdf_stat <- function(p, X) {
+  uniroot(function(x) custom_cdf_stat(x, X) - p, range(X))$root
+}
+
+bootstrap_invcdf_stat <- function(x, B, l, prob = 0.98) {
+  boot_res <- boot::tsboot(
+    tseries = x,
+    statistic = function(ts) ts,
+    R = B,
+    l = l,
+    sim = "geom",
+    endcorr = TRUE
+  )
+  
+  samples <- t(boot_res$t)  # n x B matrix
+  quantiles_matrix <- matrix(NA, nrow = length(us), ncol = B)
+  
+  for (b in 1:B) {
+    Xb <- samples[, b]
+    quantiles_matrix[, b] <- sapply(us, function(u) invcdf_stat(prob, Xb))
+  }
+  
+  quantiles_matrix
+}
+
+# Grid of time points
+us <- seq(0.1, 0.9, length.out = 500)
+date <- Y$date
+n <- length(date)
+t_index <- round(us * n)
+t_index <- pmin(pmax(t_index, 1), n)
+mapped_dates <- date[t_index]
+
+# Bootstrap parameters
+B <- 100
+l <- 30
+prob <- 0.98
+x <- Y$sq_log_return.CAC40
+
+boot_quantiles <- bootstrap_invcdf_stat(x, B, l, prob)
+
+df_boot <- data.frame(
+  u = mapped_dates,
+  lower = apply(boot_quantiles, 1, quantile, probs = 0.025),
+  mean  = apply(boot_quantiles, 1, mean),
+  upper = apply(boot_quantiles, 1, quantile, probs = 0.975)
+)
+
+# -----------------------------
+# 2. Non-Stationary Bootstrap
+# -----------------------------
+
+custom_cdf <- function(y, u, X) {
+  kernel <- kern.func(u, n = length(X), b = bn)
+  sum(kernel * (X < y)) / sum(kernel)
+}
+
+invcdf <- function(p, X, u) {
+  uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+}
+
+compute_quantile_data <- function(Y_series, bn_values, us, prob = 0.98, series_name = "Series") {
+  results_list <- lapply(bn_values, function(bn_val) {
+    quant_98 <- sapply(us, function(u) {
+      bn <<- bn_val
+      invcdf(prob, Y_series, u = u)
+    })
+    data.frame(
+      u = mapped_dates,
+      Quantile_98 = quant_98,
+      bn = as.factor(bn_val),
+      series = series_name
+    )
+  })
+  do.call(rbind, results_list)
+}
+
+bn_values <- c(bnopt)
+Y_CAC <- Y$sq_log_return.CAC40
+Y_DAX <- Y$sq_log_return.DAX
+
+data_CAC <- compute_quantile_data(Y_CAC, bn_values, us, prob, "sq_log_return.CAC40")
+data_DAX <- compute_quantile_data(Y_DAX, bn_values, us, prob, "sq_log_return.DAX")
+
+# -----------------------------
+# 3. Plotting
+# -----------------------------
+
+# Plot colors
+col_stationary <- "firebrick3"
+col_tv <- "steelblue3"
+
+make_quantile_plot <- function(df_boot, data_tv, mapped_dates, title, ylim_max = NULL) {
+  p <- ggplot() +
+    # annotate("rect", xmin = u_2005, xmax = u_2007, ymin = -Inf, ymax = Inf, fill = "grey90", alpha = 0.5) 
+    annotate("rect", xmin = u_2008, xmax = u_2010, ymin = -Inf, ymax = Inf, fill = "grey75", alpha = 0.5) +
+    annotate("rect", xmin = u_2011, xmax = u_2013, ymin = -Inf, ymax = Inf, fill = "grey60", alpha = 0.5) +
+ 
+    # Stationary bootstrap mean & bounds
+    geom_line(data = df_boot, aes(x = u, y = mean), color = col_stationary, size = 1.2) +
+    geom_line(data = df_boot, aes(x = u, y = lower), color = col_stationary, linetype = "dashed", size = 0.8) +
+    geom_line(data = df_boot, aes(x = u, y = upper), color = col_stationary, linetype = "dashed", size = 0.8) +
+    
+    # Time-varying quantile (loess smooth)
+    geom_smooth(data = data_tv %>% mutate(u_num = as.numeric(u)),
+                aes(x = u_num, y = Quantile_98),
+                color = col_tv, size = 1.2, span = 0.02, se = FALSE, method = "loess") +
+    
+    # X-axis labels
+    scale_x_continuous(name = "Time",
+                       breaks = as.numeric(mapped_dates[seq(1, length(mapped_dates), length.out = 6)]),
+                       labels = format(mapped_dates[seq(1, length(mapped_dates), length.out = 6)], "%Y")) +
+    
+    labs(title = title, x = "Time", y = "Estimated Value") +
+    theme_minimal(base_size = 14, base_family = "Times") +
+    theme(panel.grid = element_blank(),
+          legend.position = "none",
+          plot.title = element_text(size = 10, family = "Times"),
+          axis.title = element_text(size = 10, family = "Times"),
+          axis.text = element_text(size = 10, family = "Times"))
+  
+  if (!is.null(ylim_max)) {
+    p <- p + ylim(0, ylim_max)
+  }
+  p
+}
+
+quantCAC_sq <- make_quantile_plot(df_boot, data_CAC, mapped_dates,
+                                  "Estimated 98% quantiles: CAC squared log-returns")
+
+quantDAX_sq <- make_quantile_plot(df_boot, data_DAX, mapped_dates,
+                                  "Estimated 98% quantiles: DAX squared log-returns",
+                                  ylim_max = 0.0045)
+
+# Arrange plots side by side
+combined_plot <- grid.arrange(quantCAC_sq, quantDAX_sq, ncol = 2)
+
+
+```
+
+
+# Section: Estimation of joint extremal dependence
+
+## 3.1 Motivation plot
+
+```{r}
+# ----------------------------------------------------
+# Extreme Value Analysis: Threshold Estimation & Plots
+# ----------------------------------------------------
+
+library(tidyverse)
+library(lubridate)
+library(gridExtra)
+library(boot)
+library(ggplot2)
+
+prob <- 0.95
+n <- length(Y$sq_log_return.CAC40)
+time_scaled <- seq_len(n) / n
+
+# Target dates and mapping to scaled time
+target <- as.Date(c("1996-07-02", "2004-07-02", "2012-07-02"))
+closest_idx <- sapply(target, function(x) which.min(abs(Y$date - x)))
+target_us <- time_scaled[closest_idx]
+
+# Define periods around target dates
+years_before <- 1
+years_after  <- 1
+letters_labels <- paste0(letters[1:length(target)], ")")
+
+periods <- lapply(seq_along(target), function(i) {
+  d <- target[i]
+  start_year <- year(d) - years_before
+  end_year   <- year(d) + years_after
+  list(
+    start = as.Date(paste0(start_year, "-01-01")),
+    end   = as.Date(paste0(end_year,   "-12-31")),
+    label = paste0(letters_labels[i], " ", start_year, "–", end_year)
+  )
+})
+
+# ----------------------------------------------------
+# Estimate thresholds for each target period
+# ----------------------------------------------------
+
+bn <- bnopt
+estam <- numeric(length(target_us))
+
+for (i in seq_along(target_us)) {
+  y <- as.matrix(Y[, 2:3])
+  
+  # Kernel CDF
+  custom_cdf <- function(val, u, X) {
+    n <- length(X)
+    kernel <- kern.func(u, n, bn)
+    sum(kernel * (X < val)) / sum(kernel)
+  }
+  
+  invcdf <- function(p, X, u) {
+    uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+  }
+  
+  row_max <- apply(abs(y), 1, max)
+  estam[i] <- invcdf(prob, row_max, target_us[i])
+}
+
+# ----------------------------------------------------
+# Filter data for a given period
+# ----------------------------------------------------
+
+filter_period_data_Y <- function(CAC40, DAX, start_date, end_date) {
+  CAC_filtered <- CAC40 %>%
+    filter(date >= start_date & date <= end_date) %>%
+    mutate(cac_sq = log_return^2) %>%
+    select(date, cac_sq)
+  
+  DAX_filtered <- DAX %>%
+    filter(date >= start_date & date <= end_date) %>%
+    mutate(dax_sq = log_return^2) %>%
+    select(date, dax_sq)
+  
+  inner_join(CAC_filtered, DAX_filtered, by = "date") %>% drop_na()
+}
+
+# ----------------------------------------------------
+# Plot extremes for a period
+# ----------------------------------------------------
+
+make_extreme_plot_Y <- function(data, x_threshold, title, letter) {
+  extreme_data <- data %>% filter(cac_sq > x_threshold & dax_sq > x_threshold)
+  nonextreme_data <- data %>% filter(cac_sq <= x_threshold | dax_sq <= x_threshold)
+  DAXextreme_data <- data %>% filter(cac_sq <= x_threshold & dax_sq > x_threshold)
+  CACextreme_data <- data %>% filter(dax_sq <= x_threshold & cac_sq > x_threshold)
+  
+  max_val_total <- 7.7
+  xlab <- bquote(frac(X[1]^2, hat(q)[n](u[.(letter)], 0.95)))
+  ylab <- bquote(frac(X[2]^2, hat(q)[n](u[.(letter)], 0.95)))
+  
+  ggplot(extreme_data, aes(x = cac_sq/x_threshold, y = dax_sq/x_threshold)) +
+    geom_point(color = "darkred", alpha = 0.7, size = 1.4, shape = 16) +
+    geom_point(data = nonextreme_data, aes(x = cac_sq/x_threshold, y = dax_sq/x_threshold),
+               color = "lightgrey", alpha = 0.7, size = 1.4, shape = 16) +
+    geom_point(data = CACextreme_data, aes(x = cac_sq/x_threshold, y = dax_sq/x_threshold),
+               color = "skyblue4", alpha = 0.7, size = 1.4, shape = 17) +
+    geom_point(data = DAXextreme_data, aes(x = cac_sq/x_threshold, y = dax_sq/x_threshold),
+               color = "springgreen4", alpha = 0.7, size = 1.4, shape = 4) +
+    annotate("segment", x = 0, xend = max_val_total, y = 1, yend = 1,
+             color = "lightgrey", linetype = "dashed", alpha = 0.8, size = 0.7) +
+    annotate("segment", x = 1, xend = 1, y = 0, yend = max_val_total,
+             color = "lightgrey", linetype = "dashed", alpha = 0.8, size = 0.7) +
+    scale_x_continuous(breaks = seq(0, max_val_total, by = 1)) +
+    scale_y_continuous(breaks = seq(0, max_val_total, by = 1)) +
+    labs(title = title, x = xlab, y = ylab) +
+    coord_cartesian(xlim = c(0, max_val_total), ylim = c(0, max_val_total)) +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_line(color = "grey90", size = 0.2),
+      panel.grid.minor = element_line(color = "grey95", size = 0.1),
+      aspect.ratio = 1,
+      plot.title = element_text(size = 12, family = "Times"),
+      axis.title = element_text(size = 10, family = "Times"),
+      axis.text = element_text(size = 10, family = "Times")
+    )
+}
+
+# ----------------------------------------------------
+# Generate plots for all periods
+# ----------------------------------------------------
+
+plots_Y_surface <- list()
+letters_plot <- letters[1:length(periods)]
+
+for (i in seq_along(periods)) {
+  period <- periods[[i]]
+  data_period <- filter_period_data_Y(CAC40, DAX, period$start, period$end)
+  plots_Y_surface[[i]] <- make_extreme_plot_Y(data_period, estam[i], paste(period$letter, "Period:", period$label), letters_plot[i])
+}
+
+# Display side-by-side
+gridExtra::grid.arrange(grobs = plots_Y_surface, ncol = 3)
+
+# Save PDF
+pdf("figures/setCandsetA.pdf", height = 4, width = 9)
+gridExtra::grid.arrange(grobs = plots_Y_surface, ncol = 3)
+dev.off()
+```
+
+## 3.2 Limiting ratio of measures plots
+
+```{r}
+#==================================================
+# Extremogram Plot: Time-varying vs Stationary
+#==================================================
+
+library(ggplot2)
+library(dplyr)
+library(boot)
+
+#-------------------------
+# Parameters
+#-------------------------
+prob <- 0.95
+bn <- bnopt       # bandwidth for kernel smoothing
+mn <- 1 / (1 - prob)
+B <- 500          # bootstrap replicates
+l_block <- 30     # mean block length for stationary bootstrap
+s <- 300          # number of points for time grid
+
+us <- seq(0.15, 0.85, length.out = s)
+date <- Y$date
+n <- length(date)
+
+# Map u -> dates
+t_index <- round(us * n)
+t_index <- pmin(pmax(t_index, 1), n)
+mapped_dates <- date[t_index]
+
+#-------------------------
+# Stationary Bootstrap Function
+#-------------------------
+est_fun <- function(tsb) {
+  X_mat <- as.matrix(tsb)
+  custom_cdf <- function(y, X) sum(X < y) / length(X)
+  invcdf <- function(p, X) uniroot(function(x) custom_cdf(x, X) - p, range(X))$root
+  
+  row_max <- apply(abs(X_mat), 1, max)
+  level <- invcdf(prob, row_max)
+  
+  x <- X_mat[,1] / level
+  y <- X_mat[,2] / level
+  
+  band_C <- (x > 1 & y > 1)
+  band_A <- (x > 1 | y > 1)
+  
+  nuC <- mn / length(X_mat[,1]) * sum(band_C)
+  nuA <- mn / length(X_mat[,1]) * sum(band_A)
+  
+  nuC / nuA
+}
+
+# Stationary bootstrap
+est_stat <- tsboot(Y[, 2:3], est_fun, R = B, l = l_block, sim = "geom")
+
+#-------------------------
+# Time-varying Estimator
+#-------------------------
+estcross <- numeric(s)
+leveltv <- numeric(s)
+x_mat <- as.matrix(Y[, 2:3])
+
+for (i in 1:s) {
+  custom_cdf <- function(y, u, X) {
+    kernel <- kern.func(u, n, bn)
+    sum(kernel * (X < y)) / sum(kernel)
+  }
+  invcdf <- function(p, X, u) uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+  
+  row_max <- apply(abs(x_mat), 1, max)
+  leveltv[i] <- invcdf(prob, row_max, us[i])
+  
+  kern <- kern.func(u0 = us[i], n = n, b = bn)
+  
+  x <- x_mat[,1] / leveltv[i]
+  y <- x_mat[,2] / leveltv[i]
+  
+  band_C <- (x > 1 & y > 1)
+  band_A <- (x > 1 | y > 1)
+  
+  estcross[i] <- mn / (n * bn) * sum(kern * band_C) /
+                  (mn / (n * bn) * sum(kern * band_A))
+}
+
+df_local <- data.frame(u = mapped_dates, est = estcross)
+
+# Stationary bootstrap summary
+boot_values <- est_stat$t
+df_boot <- data.frame(
+  u = mapped_dates,
+  lower = quantile(boot_values, 0.025),
+  mean  = mean(boot_values),
+  upper = quantile(boot_values, 0.975)
+)
+
+#-------------------------
+# Plotting
+#-------------------------
+col_stationary <- "firebrick3"
+col_tv <- "steelblue3"
+
+cross_ext_plot <- ggplot() +
+  # Macro periods
+  annotate("rect", xmin = as.Date("2008-01-01"), xmax = as.Date("2010-12-31"),
+           ymin = -Inf, ymax = Inf, fill = "grey75", alpha = 0.5) +
+  annotate("rect", xmin = as.Date("2011-01-01"), xmax = as.Date("2013-12-31"),
+           ymin = -Inf, ymax = Inf, fill = "grey60", alpha = 0.5) +
+  # Stationary bootstrap mean and CI
+  geom_line(data = df_boot, aes(x = u, y = mean), color = col_stationary, size = 1.2) +
+  geom_line(data = df_boot, aes(x = u, y = lower), color = col_stationary,
+            linetype = "dashed", size = 0.8) +
+  geom_line(data = df_boot, aes(x = u, y = upper), color = col_stationary,
+            linetype = "dashed", size = 0.8) +
+  # Time-varying estimate
+  geom_smooth(data = df_local %>% mutate(u_num = as.numeric(u)),
+              aes(x = u_num, y = est), color = col_tv, size = 1.2,
+              span = 0.06, se = FALSE, method = "loess") +
+  scale_x_continuous(name = "Time",
+                     breaks = as.numeric(mapped_dates[seq(1, length(mapped_dates), length.out = 9)]),
+                     labels = format(mapped_dates[seq(1, length(mapped_dates), length.out = 9)], "%Y")) +
+  scale_y_continuous(name = "Estimated value", breaks = seq(0, 1, by = 0.1),
+                     limits = c(0, 0.8), expand = c(0, 0)) +
+  labs(title = expression("Estimation of " * pi[1](u))) +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(panel.grid = element_blank(), legend.position = "none")
+
+cross_ext_plot
+
+```
+
+
