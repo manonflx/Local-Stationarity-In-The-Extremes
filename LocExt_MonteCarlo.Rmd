@@ -1,0 +1,938 @@
+---
+title: "LocExt_MonteCarlo"
+author: "Manon Felix"
+date: "2025-11-15"
+output: html_document
+---
+
+
+# =========================================================
+# R Code for Local Stationarity in the Extremes
+# Author: Manon FELIX
+# Date: [December 2025]
+# =========================================================
+
+
+
+# 1. Load Packages
+
+```{r}
+# tikzDevice: export plots to LaTeX
+library(tikzDevice)
+
+# Set timezone to California
+options(tz = "CA")
+
+# Data wrangling
+library(tibble)
+library(tidyverse)
+library(dplyr)
+
+# Matrix calculations
+library(matrixcalc)
+
+# Extreme value and stable distributions
+library(evd)
+library(stabledist)
+
+# Plotting
+library(ggplot2)
+library(ggtext)
+```
+
+
+
+
+# 2. Functions
+
+# 2.1 Second Derivative
+
+```{r}
+# Computes the Hessian (second derivative) of a multivariate function
+# Reference: Rdistance package
+#
+# Args:
+#   x    : numeric vector (point at which to evaluate)
+#   FUN  : function to compute Hessian of
+#   eps  : small perturbation for numerical derivative (default 1e-8)
+#   ...  : additional arguments for FUN
+#
+# Returns:
+#   Hessian matrix (d x d)
+
+secondDeriv <- function(x, FUN, eps = 1e-8, ...) {
+  d <- length(x)   # number of dimensions
+
+  # Ensure eps vector has correct length
+  if(d > length(eps)){
+    eps <- rep(eps, ceiling(d / length(eps)))[1:d]
+  } else if(length(eps) > d){
+    eps <- eps[1:d]
+  }
+
+  FUN <- match.fun(FUN)
+  hess <- matrix(0, nrow = d, ncol = d)
+  h <- ifelse(x == 0, eps^0.25, (eps^0.25) * x)
+
+  for(i in 1:d){
+    ei <- rep(0, d)
+    ei[i] <- 1
+
+    # Diagonal elements
+    hess[i,i] <- (-FUN(x + 2*h*ei, ...) + 
+                   16*FUN(x + h*ei, ...) - 
+                   30*FUN(x, ...) +
+                   16*FUN(x - h*ei, ...) - 
+                   FUN(x - 2*h*ei, ...)) / (12 * h[i]^2)
+
+    # Off-diagonal elements
+    if((i+1) <= d){
+      for(j in (i+1):d){
+        ej <- rep(0, d)
+        ej[j] <- 1
+
+        hess[i,j] <- (FUN(x + h*ei + h*ej, ...) - 
+                        FUN(x + h*ei - h*ej, ...) -
+                        FUN(x - h*ei + h*ej, ...) + 
+                        FUN(x - h*ei - h*ej, ...)) / (4 * h[i] * h[j])
+
+        # Symmetry
+        hess[j,i] <- hess[i,j]
+      }
+    }
+  }
+
+  return(hess)
+}
+```
+
+
+
+
+# 2.2 Kernel Function
+
+
+```{r}
+# Kernel function for smoothing or density estimation
+#
+# Args:
+#   u0 : numeric, evaluation point
+#   n  : numeric, number of observations
+#   b  : numeric, bandwidth
+#
+# Returns:
+#   Numeric vector of kernel weights
+
+kern.func <- function(u0, n, b) {
+  u <- (u0 - (1:n)/n) / b
+  K <- ifelse(abs(u) < 1/2, 6 * (0.25 - abs(u)^2), 0)
+  return(K)
+}
+```
+
+
+# 3. Time-varying M4 process
+
+Description: Defines localized estimators, psi functions, plots, normalized sums, and optimal bandwidth calculations.
+
+
+
+```{r}
+# -----------------------------
+# 1. Localized Estimator
+# -----------------------------
+locest_am <- function(u, bn, x, prob, marg = 2){
+  
+  x <- as.matrix(x)
+  n <- ifelse(is.null(dim(x)), length(x), dim(x)[1])
+  mn <- 1/(1 - prob)
+  
+  # Custom CDF using kernel
+  custom_cdf <- function(y, u, X) {
+    n <- length(X)
+    kernel <- kern.func(u, n, bn)
+    sum(kernel * (X < y)) / sum(kernel)
+  }
+
+  # Inverse CDF
+  invcdf <- function(p, X, u) {
+    uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+  }
+  
+  row_max <- apply(abs(x), 1, max)
+  level <- invcdf(prob, row_max, u)
+  
+  kernel <- kern.func(u, n, bn)
+  
+  if (marg == 1 || marg == 2) {
+    estim <- if (is.null(dim(x))) {
+      ind <- x > level
+      mn/(n*bn) * sum(ind * kernel)
+    } else {
+      binary_rows <- (x[,marg] > level)
+      mn/(n * bn) * sum(kernel * as.numeric(binary_rows))
+    }
+  } else {
+    estim <- if (is.null(dim(x))) {
+      ind <- x > level
+      mn/(n*bn) * sum(ind * kernel)
+    } else {
+      binary_rows <- (x[,1] > level) & (x[,2] > level)
+      mn/(n * bn) * sum(kernel * as.numeric(binary_rows))
+    }
+  }
+  
+  return(estim)
+}
+
+# -----------------------------
+# 2. M4(2) Process: Parameter Function
+# -----------------------------
+psi <- function(u, j, l, k){
+  if (k == 1){
+    val <- (l + 1) * 15 + 10 * (1 - 1.5 * u)
+  } else {
+    val <- (2 * (l + 1)) / (1 - abs(0.9 * sin((pi/2) * j - pi * u))^k)
+  }
+  return(val)
+}
+
+# -----------------------------
+# 3. Plot of psi functions
+# -----------------------------
+s <- 70
+us <- seq(0.1, 0.9, length.out = s)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+
+# (j=1, l=0)
+plot(us, psi(us, j=1, l=0, k=1),
+     type="l", col="blue", lwd=2,
+     xlim=c(0,1), ylim=c(0,40),
+     ylab="psi(u)", xlab="u",
+     main="j=1, l=0")
+lines(us, psi(us, j=1, l=0, k=2), col="red", lwd=2, lty=2)
+legend("topright", legend=c("k=1","k=2"), col=c("blue","red"),
+       lty=c(1,2), lwd=2, bty="n", cex=0.8)
+
+# (j=1, l=1)
+plot(us, psi(us, j=1, l=1, k=1),
+     type="l", col="blue", lwd=2,
+     xlim=c(0,1), ylim=c(0,40),
+     ylab="psi(u)", xlab="u",
+     main="j=1, l=1")
+lines(us, psi(us, j=1, l=1, k=2), col="red", lwd=2, lty=2)
+
+# (j=0, l=0)
+plot(us, psi(us, j=0, l=0, k=1),
+     type="l", col="blue", lwd=2,
+     xlim=c(0,1), ylim=c(0,40),
+     ylab="psi(u)", xlab="u",
+     main="j=0, l=0")
+lines(us, psi(us, j=0, l=0, k=2), col="red", lwd=2, lty=2)
+
+# (j=0, l=1)
+plot(us, psi(us, j=0, l=1, k=1),
+     type="l", col="blue", lwd=2,
+     xlim=c(0,1), ylim=c(0,60),
+     ylab="psi(u)", xlab="u",
+     main="j=0, l=1")
+lines(us, psi(us, j=0, l=1, k=2), col="red", lwd=2, lty=2)
+
+# -----------------------------
+# 4. Limiting Quantities
+# -----------------------------
+normalized_min_sum <- function(u, alpha, b) {
+  numerator <- 0
+  denominator <- 0
+
+  for (l in 0:1) {
+    for (j in 0:1) {
+      psi1 <- psi(u, j, l, 1)
+      psi2 <- psi(u, j, l, 2)
+      min_val <- min(psi1 / b, psi2 / b)
+      numerator <- numerator + min_val^alpha
+      max_val <- max(psi1^alpha, psi2^alpha)
+      denominator <- denominator + max_val
+    }
+  }
+  return(numerator / denominator)
+}
+
+alpha <- 1.8
+b <- 1
+a <- 1
+u_grid <- seq(0, 1, length.out = 200)
+values <- sapply(u_grid, function(u) normalized_min_sum(u, alpha, b))
+
+plot(u_grid, values, type = "l", col = "tomato", lwd = 2,
+     xlab = "u", ylab = "Normalized Min Sum",
+     main = expression(paste("Plot of Normalized ", min, " Sum vs ", u)))
+
+seq_value <- function(u, alpha) {
+  total <- 0
+  for (l in 0:1) {
+    for (j in 0:1) {
+      max_k <- max(psi(u, j, l, 1)^alpha, psi(u, j, l, 2)^alpha)
+      total <- total + max_k
+    }
+  }
+  return(total)
+}
+
+# -----------------------------
+# 5. Optimal Bandwidth
+# -----------------------------
+u_grid <- seq(0, 1, length.out = 500)
+values <- sapply(u_grid, function(u) secondDeriv(u, normalized_min_sum, alpha = alpha, b = 1))
+
+plot(u_grid, values, type = "l", col = "tomato", lwd = 2,
+     xlab = "u", ylab = "Second Derivative",
+     main = "Second derivative of normalized_min_sum")
+
+n <- 9000
+prob <- 0.98
+mn <- 1/(1 - prob)
+
+band_opt <- function(u){
+  (mn/n)^(1/5) * (0.05 * (normalized_min_sum(u, alpha, b)+ 2) / 
+                   (mn * secondDeriv(u, normalized_min_sum, alpha = alpha, b = 1) * 0.05)^2)^(1/5)
+}
+
+delta <- 0.2
+u_grid <- seq(0 + delta, 1 - delta, length.out = 1000)
+values <- sapply(u_grid, function(u) band_opt(u))
+plot(u_grid, values, main = "Second derivative based bandwidth")
+
+a1 <- function(u) {0.5 * mn * secondDeriv(u, normalized_min_sum, alpha = alpha, b = 1) * 0.05}
+a2 <- function(u) {0.05 * (normalized_min_sum(u, alpha, b) + 2)}
+
+bnopt <- function(u){
+  (mn/n * a2(u) / (4 * a1(u)^2))^(1/5)
+}
+
+IMSE <- function(bn){
+  u_grid <- seq(0 + delta, 1 - delta, length.out = 200)
+  values <- sapply(u_grid, function(u) bn^4 * a1(u) + mn/(n*bn) * a2(u))
+  pracma::trapz(u_grid, values)
+}
+
+bn_grid <- seq(0.03, 0.25, length.out = 100)
+values <- sapply(bn_grid, function(bn) IMSE(bn))
+
+pdf("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/bnIMSE.pdf", width = 8, height = 6)
+plot(bn_grid, values, ylab = "IMSE", xlab = "bn", type = "l", main = "IMSE for different values of the bandwidth")
+abline(v = bn_grid[which.min(values)], col = "red")
+dev.off()
+
+bnopt <- bn_grid[which.min(values)]
+```
+
+
+# 3.1 Functional Boxplots: Quantile Estimation
+
+
+```{r}
+# -----------------------------
+# Settings and Parameters
+# -----------------------------
+prob <- 0.98
+alpha <- 1.8
+mn <- 1 / (1 - prob)
+bn <- bnopt   # Optimal bandwidth from previous calculations
+s <- 80       # Number of grid points for u
+us <- seq(0.2, 0.8, length.out = s)
+mt <- 1       # Number of Monte Carlo simulations
+n <- 9000     # Sample size
+set.seed(123)
+
+# -----------------------------
+# Define Quantile Functions
+# -----------------------------
+# Kernel-based CDF
+custom_cdf <- function(y, u, X) {
+  kernel <- kern.func(u, n, bn)
+  binary_rows <- (X < y)
+  1 / (n * bn) * sum(kernel * as.numeric(binary_rows))
+}
+
+# Inverse CDF using root finding
+invcdf <- function(p, X, u = u0) {
+  uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+}
+
+# Empirical (global) CDF
+custom_cdf_stat <- function(y, X) {
+  n <- length(X)
+  binary_rows <- (X < y)
+  sum(binary_rows) / n
+}
+
+# Inverse empirical CDF
+invcdf_stat <- function(p, X) {
+  uniroot(function(x) custom_cdf_stat(x, X) - p, range(X))$root
+}
+
+# -----------------------------
+# Monte Carlo Simulation
+# -----------------------------
+estQlocal_mat <- matrix(NA, nrow = mt, ncol = s)
+estQglobal_mat <- matrix(NA, nrow = mt, ncol = s)
+
+for (b in 1:mt) {
+  # Generate Frechet noise
+  df <- as.data.frame(matrix(rfrechet(n * 4, shape = alpha), nrow = n, ncol = 4))
+  
+  # Random constants
+  C_values <- sample(1:50, 4, replace = TRUE)
+  
+  # Simulate X_b
+  X_b <- matrix(NA, nrow = n, ncol = 2)
+  for (k in 1:2){
+    for (i in 1:n){
+      u <- i / n
+      X_b[i, k] <- max(
+        max((psi(u, j = 0, l = 0, k) + C_values[1]/n) * df[i, 1],
+            (psi(u, j = 1, l = 0, k) + C_values[2]/n) * df[i, 2]),
+        max((psi(u, j = 0, l = 1, k) + C_values[3]/n) * df[i, 3],
+            (psi(u, j = 1, l = 1, k) + C_values[4]/n) * df[i, 4])
+      )
+    }
+  }
+  
+  # Compute quantiles
+  row_max_b <- apply(abs(X_b), 1, max)
+  estQglobal_mat[b, ] <- invcdf_stat(p = prob, X = row_max_b)
+  for (i in 1:s) {
+    estQlocal_mat[b, i] <- invcdf(p = prob, X = row_max_b, u = us[i])
+  }
+  
+  print(b)
+}
+
+# Save results
+save(estQglobal_mat, estQlocal_mat, file = "/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estQ_matrices.RData")
+load("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estQ_matrices.RData")
+
+# -----------------------------
+# Convert to Long Data Frames
+# -----------------------------
+# TIME-VARYING
+estQlocal_df <- as_tibble(estQlocal_mat)
+colnames(estQlocal_df) <- paste0("u_", round(us, 4))
+estQlocal_df <- estQlocal_df %>% 
+  mutate(sim = 1:mt) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+# FIXED
+estQglobal_df <- as_tibble(estQglobal_mat)
+colnames(estQglobal_df) <- paste0("u_", round(us, 3))
+estQglobal_df <- estQglobal_df %>% 
+  mutate(sim = 1:mt) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+# -----------------------------
+# True Sequence for Comparison
+# -----------------------------
+sigma <- sapply(us, function(u) seq_value(u, alpha))
+true_seq <- (1/(1 - prob) * sigma)^(1/alpha)
+comparison_df <- data.frame(u = us, value = true_seq)
+
+# -----------------------------
+# Compute Summary Statistics
+# -----------------------------
+# TIME-VARYING
+summary_stats <- estQlocal_df %>%
+  group_by(u) %>%
+  summarise(
+    median = median(estimate, na.rm = TRUE),
+    q25 = quantile(estimate, 0.25, na.rm = TRUE),
+    q75 = quantile(estimate, 0.75, na.rm = TRUE)
+  )
+
+# FIXED
+summary_fixed <- estQglobal_df %>%
+  group_by(u) %>%
+  summarise(
+    median = median(estimate, na.rm = TRUE),
+    q25 = quantile(estimate, 0.25, na.rm = TRUE),
+    q75 = quantile(estimate, 0.75, na.rm = TRUE)
+  )
+
+# -----------------------------
+# Plot Functional Boxplots
+# -----------------------------
+col_fixed <- "firebrick3"
+col_local <- "steelblue3"
+
+estQ_plot <- ggplot() +
+  # Fixed estimator
+  geom_ribbon(data = summary_fixed, aes(x = u, ymin = q25, ymax = q75), fill = col_fixed, alpha = 0.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = median), color = col_fixed, size = 1.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = q25), color = col_fixed, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_fixed, aes(x = u, y = q75), color = col_fixed, linetype = "dashed", size = 0.8) +
+  
+  # Local estimator
+  geom_ribbon(data = summary_stats, aes(x = u, ymin = q25, ymax = q75), fill = col_local, alpha = 0.2) +
+  geom_line(data = summary_stats, aes(x = u, y = median), color = col_local, size = 1.2) +
+  geom_line(data = summary_stats, aes(x = u, y = q25), color = col_local, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_stats, aes(x = u, y = q75), color = col_local, linetype = "dashed", size = 0.8) +
+  
+  # Comparison line
+  geom_line(data = comparison_df, aes(x = u, y = value), linetype = "dotted", color = "black", size = 0.8) +
+  
+  # Labels & theme
+  labs(title = "Estimation of",
+       subtitle = expression("time-varying quantile " * q(u, 1 - 1/m[n])),
+       x = "u",
+       y = "Estimated value") +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 16, family = "Times"),
+        axis.title = element_text(size = 14, family = "Times"),
+        axis.text = element_text(size = 14, family = "Times"))
+
+estQ_plot
+
+```
+
+
+# 3.2 Functional Boxplot: Joint Measure ν1(u, C)
+
+```{r}
+library(tidyverse)
+library(boot)
+
+# -----------------------------
+# Settings and Parameters
+# -----------------------------
+prob <- 0.98
+alpha <- 1.8
+mn <- 1 / (1 - prob)
+bn <- bnopt       # Optimal bandwidth from previous calculations
+s <- 80           # Number of grid points for u
+us <- seq(0.2, 0.8, length.out = s)
+B <- 1000         # Number of Monte Carlo simulations
+n <- 9000         # Sample size
+set.seed(123)
+
+# -----------------------------
+# Define Estimator Functions
+# -----------------------------
+# Direct joint estimator function for global measure
+est.fun <- function(tsb) {
+  mn <- 1 / (1 - prob)
+  X_mat <- as.matrix(tsb)
+  row_max <- apply(abs(X_mat), 1, max)
+  level <- quantile(row_max, prob)
+  mn * mean((X_mat[,1] > level) & (X_mat[,2] > level))
+}
+
+# -----------------------------
+# Monte Carlo Simulation
+# -----------------------------
+estPglobal_mat <- matrix(NA, nrow = B, ncol = s)
+estPlocal_mat <- matrix(NA, nrow = B, ncol = s)
+
+for (b in 1:B) {
+  # Generate Frechet noise
+  df <- as.data.frame(matrix(rfrechet(n * 4, shape = alpha), nrow = n, ncol = 4))
+  
+  # Random constants
+  C_values <- sample(1:50, 4, replace = TRUE)
+  
+  # Simulate X_b
+  X_b <- matrix(NA, nrow = n, ncol = 2)
+  for (k in 1:2) {
+    for (i in 1:n) {
+      u <- i / n
+      X_b[i, k] <- max(
+        max((psi(u, j = 0, l = 0, k) + C_values[1]/n) * df[i, 1],
+            (psi(u, j = 1, l = 0, k) + C_values[2]/n) * df[i, 2]),
+        max((psi(u, j = 0, l = 1, k) + C_values[3]/n) * df[i, 3],
+            (psi(u, j = 1, l = 1, k) + C_values[4]/n) * df[i, 4])
+      )
+    }
+  }
+  
+  # Compute estimators over grid
+  estPglobal_mat[b, ] <- est.fun(X_b)
+  for (i in 1:s) {
+    estPlocal_mat[b, i] <- locest_am(us[i], bn = bn, x = X_b, prob = prob, marg = 0)
+  }
+}
+
+# Save/load results
+save(estPglobal_mat, estPlocal_mat, file = "/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estP_matrices.RData")
+load("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estP_matrices.RData")
+
+# -----------------------------
+# Convert to Long Data Frames
+# -----------------------------
+# Time-varying estimator
+estPlocal_df <- as_tibble(estPlocal_mat)
+colnames(estPlocal_df) <- paste0("u_", round(us, 3))
+estPlocal_df <- estPlocal_df %>% 
+  mutate(sim = 1:B) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+# Fixed/global estimator
+estPglobal_df <- as_tibble(estPglobal_mat)
+colnames(estPglobal_df) <- paste0("u_", round(us, 3))
+estPglobal_df <- estPglobal_df %>% 
+  mutate(sim = 1:B) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+# -----------------------------
+# Optional Comparison Line
+# -----------------------------
+comparison_vals <- sapply(us, function(u) normalized_min_sum(u, alpha, b))
+comparison_df <- data.frame(u = us, value = comparison_vals)
+
+# -----------------------------
+# Compute Summary Statistics
+# -----------------------------
+# Time-varying estimator
+summary_stats <- estPlocal_df %>%
+  group_by(u) %>%
+  summarise(
+    median = median(estimate, na.rm = TRUE),
+    q25 = quantile(estimate, 0.25, na.rm = TRUE),
+    q75 = quantile(estimate, 0.75, na.rm = TRUE)
+  )
+
+# Fixed/global estimator
+summary_fixed <- estPglobal_df %>%
+  group_by(u) %>%
+  summarise(
+    median = median(estimate, na.rm = TRUE),
+    q25 = quantile(estimate, 0.25, na.rm = TRUE),
+    q75 = quantile(estimate, 0.75, na.rm = TRUE)
+  )
+
+# -----------------------------
+# Plot Functional Boxplots
+# -----------------------------
+col_fixed <- "firebrick3"    # Fixed/global estimator
+col_local <- "steelblue3"    # Time-varying/local estimator
+
+estP_plot <- ggplot() +
+  # Fixed estimator
+  geom_ribbon(data = summary_fixed, aes(x = u, ymin = q25, ymax = q75), fill = col_fixed, alpha = 0.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = median), color = col_fixed, size = 1.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = q25), color = col_fixed, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_fixed, aes(x = u, y = q75), color = col_fixed, linetype = "dashed", size = 0.8) +
+  
+  # Local estimator
+  geom_ribbon(data = summary_stats, aes(x = u, ymin = q25, ymax = q75), fill = col_local, alpha = 0.2) +
+  geom_line(data = summary_stats, aes(x = u, y = median), color = col_local, size = 1.2) +
+  geom_line(data = summary_stats, aes(x = u, y = q25), color = col_local, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_stats, aes(x = u, y = q75), color = col_local, linetype = "dashed", size = 0.8) +
+  
+  # Comparison line
+  geom_line(data = comparison_df, aes(x = u, y = value), linetype = "dotted", color = "black", size = 0.8) +
+  
+  # Labels and theme
+  labs(title = "Estimation of",
+       subtitle = expression("time-varying tail measure " * nu[1](u, C)),
+       x = "u",
+       y = "Estimated value") +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 16, family = "Times"),
+        axis.title = element_text(size = 14, family = "Times"),
+        axis.text = element_text(size = 14, family = "Times"))
+
+estP_plot
+
+
+```
+
+
+# 4. Time-varying AR(1) process
+
+```{r}
+# =========================================================
+# 4. Time-varying AR(1) Process + Quantile + Extremogram
+# =========================================================
+
+library(tidyverse)
+library(stabledist)
+library(gridExtra)
+
+# -----------------------------
+# AR(1) Parameter Function
+# -----------------------------
+s <- 50
+us <- seq(0.2, 0.8, length.out = s)
+
+# Sine-based time-varying coefficient
+fct_sine <- function(t, T) {
+  0.2 + 0.4*t/T + 0.2*(t/T)^2 
+}
+
+T <- length(us)
+t <- 1:T
+plot(us, fct_sine(t, T))
+
+fct_sine_u <- function(u) {
+  0.2 + 0.4*u + 0.2*(u)^2 
+}
+
+# Function for series sum (used for theoretical quantiles)
+series_sum <- function(u, alpha) {
+  r <- abs(fct_sine_u(u))^alpha
+  1 / (1 - r)
+}
+```
+
+
+
+# 4.1 Functional Boxplots: Extreme Quantile
+
+```{r}
+dim_para <- 1
+alpha <- 1
+prob <- 0.98
+s <- 80
+us <- seq(0.2, 0.8, length.out = s)
+B <- 1000
+n <- 9000
+bn <- bnopt  # candidate bandwidth
+
+# Custom CDF function
+custom_cdf <- function(y, u, X) {
+  kernel <- kern.func(u, n, bn)
+  binary_rows <- (X < y)
+  1 / (n * bn) * sum(kernel * as.numeric(binary_rows))
+}
+
+# Inverse CDF using root finding
+invcdf <- function(p, X, u = u0) {
+  uniroot(function(x) custom_cdf(x, u = u, X) - p, range(X))$root
+}
+
+# Empirical CDF (no kernel)
+custom_cdf_stat <- function(y, X) {
+  n <- length(X)
+  binary_rows <- (X < y)
+  sum(binary_rows) / n
+}
+
+invcdf_stat <- function(p, X) {
+  uniroot(function(x) custom_cdf_stat(x, X) - p, range(X))$root
+}
+
+# Monte Carlo simulation for quantiles
+estQlocal_mat <- matrix(NA, nrow = B, ncol = s)
+estQglobal_mat <- matrix(NA, nrow = B, ncol = s)
+set.seed(123)
+
+for (b in 1:B) {
+  print(b)
+  eps <- rstable(n, alpha = alpha, beta = 0)
+  X_b <- array(NA, dim = n)
+  X_b[1:dim_para] <- 0 
+  
+  for (j in dim_para:(n-1)) {
+    X_b[j + 1] <- rep(as.numeric(fct_sine(j+1, n)), dim_para) %*% X_b[(j-(dim_para-1)):j] + eps[j]
+  }
+  
+  estQglobal_mat[b, ] <- invcdf_stat(p = prob, X = abs(X_b))
+  for (i in 1:s) {
+    estQlocal_mat[b, i] <- invcdf(p = prob, X = abs(X_b), u = us[i])
+  }
+}
+
+save(estQglobal_mat, estQlocal_mat, file = "/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estQAR_matrices.RData")
+load("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estQAR_matrices.RData")
+
+# Convert to long data frames
+estQlocal_df <- as_tibble(estQlocal_mat) %>%
+  set_names(paste0("u_", round(us, 3))) %>%
+  mutate(sim = 1:B) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+estQglobal_df <- as_tibble(estQglobal_mat) %>%
+  set_names(paste0("u_", round(us, 3))) %>%
+  mutate(sim = 1:B) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+# Comparison line: theoretical quantile
+comparison_df <- data.frame(u = us) %>%
+  rowwise() %>%
+  mutate(
+    gamma = (series_sum(u, alpha))^(1/alpha),
+    value = qstable((1 + prob)/2, alpha = alpha, beta = 0, gamma = gamma, delta = 0)
+  ) %>%
+  ungroup()
+
+# Compute summary statistics for functional boxplots
+summary_stats <- estQlocal_df %>%
+  group_by(u) %>%
+  summarise(median = median(estimate, na.rm = TRUE),
+            q25 = quantile(estimate, 0.25, na.rm = TRUE),
+            q75 = quantile(estimate, 0.75, na.rm = TRUE))
+
+summary_fixed <- estQglobal_df %>%
+  group_by(u) %>%
+  summarise(median = median(estimate, na.rm = TRUE),
+            q25 = quantile(estimate, 0.25, na.rm = TRUE),
+            q75 = quantile(estimate, 0.75, na.rm = TRUE))
+
+# Colors
+col_fixed <- "firebrick3"
+col_local <- "steelblue3"
+
+# Plot functional boxplots
+estQ_plotAR <- ggplot() +
+  geom_ribbon(data = summary_fixed, aes(x = u, ymin = q25, ymax = q75), fill = col_fixed, alpha = 0.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = median), color = col_fixed, size = 1.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = q25), color = col_fixed, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_fixed, aes(x = u, y = q75), color = col_fixed, linetype = "dashed", size = 0.8) +
+  geom_ribbon(data = summary_stats, aes(x = u, ymin = q25, ymax = q75), fill = col_local, alpha = 0.2) +
+  geom_line(data = summary_stats, aes(x = u, y = median), color = col_local, size = 1.2) +
+  geom_line(data = summary_stats, aes(x = u, y = q25), color = col_local, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_stats, aes(x = u, y = q75), color = col_local, linetype = "dashed", size = 0.8) +
+  geom_line(data = comparison_df, aes(x = u, y = value), linetype = "dotted", color = "black", size = 0.8) +
+  labs(title = "Estimation of",
+       subtitle = expression("time-varying quantile " * q(u, 1 - 1/m[n])),
+       x = "u", y = "Estimated value") +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 16, family = "Times"),
+        axis.title = element_text(size = 14, family = "Times"),
+        axis.text = element_text(size = 14, family = "Times"))
+
+estQ_plotAR
+```
+
+
+
+# 4.2 Functional Boxplots: Extremogram
+
+```{r}
+est.fun.stat <- function(tsb, h = 0) {
+  mn <- 1 / (1 - prob)
+  x <- as.matrix(tsb)
+  n <- nrow(x)
+  row_max <- apply(abs(x), 1, max)
+  level <- quantile(row_max, probs = prob)
+  if (h >= 0) {
+    X1 <- x[1:(n-h)]
+    X2 <- x[(1+h):n]
+  } else {
+    hh <- abs(h)
+    X1 <- x[(1-h):n]
+    X2 <- x[1:(n+h)]
+  }
+  band_condition <- (X1 > level) & (X2 > level)
+  mn * mean(band_condition)
+}
+
+# Monte Carlo simulation for extremogram
+estElocal_mat <- matrix(NA, nrow = B, ncol = s)
+estEglobal_mat <- matrix(NA, nrow = B, ncol = s)
+h <- 1
+
+for (b in 1:B) {
+  eps <- rstable(n, alpha = alpha, beta = 0)
+  X_b <- array(NA, dim = n)
+  X_b[1:dim_para] <- 0 
+  for (j in dim_para:(n-1)) {
+    X_b[j + 1] <- rep(as.numeric(fct_sine(j+1, n)), dim_para) %*% X_b[(j-(dim_para-1)):j] + eps[j]
+  }
+  estEglobal_mat[b, ] <- est.fun.stat(X_b, h = h)
+  
+  leveltv <- rep(NA, s)
+  for (i in 1:s) {
+    x <- as.matrix(X_b)
+    n <- nrow(x)
+    row_max <- apply(abs(x), 1, max)
+    leveltv[i] <- invcdf(prob, row_max, u = us[i], bn = bn)
+    
+    if (h >= 0) {
+      X1 <- x[1:(n-h)]
+      X2 <- x[(1+h):n]
+      kern <- kern.func(u0 = us[i], n = n-h, b = bn)
+    } else {
+      X1 <- x[(1-h):n]
+      X2 <- x[1:(n+h)]
+      kern <- kern.func(u0 = us[i], n = n+h, b = bn)
+    }
+    
+    band_condition <- (X1 > leveltv[i]) & (X2 > leveltv[i])
+    estElocal_mat[b, i] <- mn / (length(X1) * bn) * sum(kern * band_condition)
+  }
+  print(b)
+}
+
+save(estEglobal_mat, estElocal_mat, file = "/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estE_matrices.RData")
+load("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/figures/estE_matrices.RData")
+
+# Convert to long data frames
+estElocal_df <- as_tibble(estElocal_mat) %>%
+  set_names(paste0("u_", round(us, 3))) %>%
+  mutate(sim = 1:B) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+estEglobal_df <- as_tibble(estEglobal_mat) %>%
+  set_names(paste0("u_", round(us, 3))) %>%
+  mutate(sim = 1:B) %>%
+  pivot_longer(-sim, names_to = "u", values_to = "estimate") %>%
+  mutate(u = as.numeric(gsub("u_", "", u)))
+
+comparison_df <- data.frame(u = us) %>%
+  rowwise() %>%
+  mutate(value = (fct_sine_u(u))^(alpha*h)/2) %>%
+  ungroup()
+
+summary_stats <- estElocal_df %>%
+  group_by(u) %>%
+  summarise(median = median(estimate, na.rm = TRUE),
+            q25 = quantile(estimate, 0.25, na.rm = TRUE),
+            q75 = quantile(estimate, 0.75, na.rm = TRUE))
+
+summary_fixed <- estEglobal_df %>%
+  group_by(u) %>%
+  summarise(median = median(estimate, na.rm = TRUE),
+            q25 = quantile(estimate, 0.25, na.rm = TRUE),
+            q75 = quantile(estimate, 0.75, na.rm = TRUE))
+
+col_fixed <- "firebrick3"
+col_local <- "steelblue3"
+
+estE_plotAR <- ggplot() +
+  geom_ribbon(data = summary_fixed, aes(x = u, ymin = q25, ymax = q75), fill = col_fixed, alpha = 0.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = median), color = col_fixed, size = 1.2) +
+  geom_line(data = summary_fixed, aes(x = u, y = q25), color = col_fixed, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_fixed, aes(x = u, y = q75), color = col_fixed, linetype = "dashed", size = 0.8) +
+  geom_ribbon(data = summary_stats, aes(x = u, ymin = q25, ymax = q75), fill = col_local, alpha = 0.2) +
+  geom_line(data = summary_stats, aes(x = u, y = median), color = col_local, size = 1.2) +
+  geom_line(data = summary_stats, aes(x = u, y = q25), color = col_local, linetype = "dashed", size = 0.8) +
+  geom_line(data = summary_stats, aes(x = u, y = q75), color = col_local, linetype = "dashed", size = 0.8) +
+  geom_line(data = comparison_df, aes(x = u, y = value), linetype = "dotted", color = "black", size = 0.8) +
+  labs(title = "Estimation of",
+       subtitle = expression("time-varying extremogram " * nu[h+1](u, A,B)),
+       x = "u", y = "Estimated value") +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 16, family = "Times"),
+        axis.title = element_text(size = 14, family = "Times"),
+        axis.text = element_text(size = 14, family = "Times"))
+
+estE_plotAR
+
+
+
+```
+
+
+
