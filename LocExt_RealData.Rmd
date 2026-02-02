@@ -33,7 +33,7 @@ library(gridExtra)
 # -------------------------------
 setwd("/Users/manonfelix/Library/CloudStorage/OneDrive-Personnel/PhD/Research/Extrem_Manon/Data_application/CAC40GR")
 
-
+## The data comes from: https://www.investing.com/indices/cac-40-gr-historical-data
 CAC40GR_1980to2007 <- read_csv(
   "CAC40GR_1980to2007.csv", 
   col_types = cols(
