@@ -178,7 +178,29 @@ grid.arrange(qq_plots[[1]], qq_plots[[2]], qq_plots[[3]], ncol = 3)
 
 ```
 
+# 1.4 Nason local stationary test
 
+```{r}
+n <- length(Y$sq_log_return.CAC40)
+round(log2(n))  #13
+
+par(mfrow = c(1, 2))  # 1 row, 2 columns
+
+plot(
+  locits::hwtos2(Y$sq_log_return.CAC40[1:2^13]),
+  xlab = "",
+  ylab = ""
+)
+
+plot(
+  locits::hwtos2(Y$sq_log_return.DAX[1:2^13]),
+  xlab = "",
+  ylab = ""
+)
+
+dev.off()
+
+```
 
 
 
